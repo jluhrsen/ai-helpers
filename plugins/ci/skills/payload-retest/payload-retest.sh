@@ -3,7 +3,14 @@
 set -euo pipefail
 
 # ci:payload-retest - Find and retest failed payload jobs on a PR
-# Usage: ./payload-retest.sh [repo] <pr-number>
+# Usage: ./payload-retest.sh [--json] [repo] <pr-number>
+
+# Parse --json flag
+JSON_OUTPUT=false
+if [ $# -gt 0 ] && [ "$1" = "--json" ]; then
+  JSON_OUTPUT=true
+  shift
+fi
 
 # Parse arguments
 if [ $# -eq 1 ]; then
@@ -11,11 +18,13 @@ if [ $# -eq 1 ]; then
   # Auto-detect from git remote
   REPO=$(git remote -v | head -1 | sed -E 's/.*github\.com[:/]([^/]+\/[^ .]+).*/\1/' | sed 's/\.git$//' || true)
   if [ -z "$REPO" ]; then
-    echo "❌ Error: Could not detect repository from git remote."
-    echo "Please specify repo: $0 <repo> <pr-number>"
+    echo "❌ Error: Could not detect repository from git remote." >&2
+    echo "Please specify repo: $0 [--json] <repo> <pr-number>" >&2
     exit 1
   fi
-  echo "Repository: $REPO"
+  if [ "$JSON_OUTPUT" = false ]; then
+    echo "Repository: $REPO"
+  fi
 
 elif [ $# -eq 2 ]; then
   REPO_ARG="$1"
@@ -28,26 +37,37 @@ elif [ $# -eq 2 ]; then
     # Assume openshift org
     REPO="openshift/$REPO_ARG"
   fi
-  echo "Repository: $REPO"
+  if [ "$JSON_OUTPUT" = false ]; then
+    echo "Repository: $REPO"
+  fi
 
 else
-  echo "❌ Error: Invalid arguments"
-  echo "Usage: $0 [repo] <pr-number>"
+  echo "❌ Error: Invalid arguments" >&2
+  echo "Usage: $0 [--json] [repo] <pr-number>" >&2
   exit 1
 fi
 
 # Validate PR number
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-  echo "❌ Error: PR number must be numeric"
+  echo "❌ Error: PR number must be numeric" >&2
   exit 1
 fi
 
-echo ""
+if [ "$JSON_OUTPUT" = false ]; then
+  echo ""
+fi
 
 # Get payload URLs from PR comments
-echo "Searching for payload runs..."
+if [ "$JSON_OUTPUT" = false ]; then
+  echo "Searching for payload runs..."
+fi
+
 if ! PR_COMMENTS=$(gh pr view ${PR_NUMBER} --repo ${REPO} --json comments 2>/dev/null); then
-  echo "Error: Failed to fetch PR data from GitHub" >&2
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo '{"error":"Failed to fetch PR data from GitHub","failed":[],"running":[]}' >&2
+  else
+    echo "Error: Failed to fetch PR data from GitHub" >&2
+  fi
   exit 1
 fi
 
@@ -57,13 +77,19 @@ PAYLOAD_URLS=$(echo "$PR_COMMENTS" | \
   sort -u || true)
 
 if [ -z "$PAYLOAD_URLS" ]; then
-  echo "No payload runs found for this PR"
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo '{"failed":[],"running":[]}'
+  else
+    echo "No payload runs found for this PR"
+  fi
   exit 0
 fi
 
 NUM_URLS=$(echo "$PAYLOAD_URLS" | wc -l)
-echo "Found $NUM_URLS payload run(s)"
-echo ""
+if [ "$JSON_OUTPUT" = false ]; then
+  echo "Found $NUM_URLS payload run(s)"
+  echo ""
+fi
 
 # Create unique temp directory and setup cleanup
 TMPDIR=$(mktemp -d)
@@ -79,11 +105,13 @@ while read -r url; do
 done <<< "$PAYLOAD_URLS"
 wait
 
-echo "Analyzing all payload runs..."
-echo ""
+if [ "$JSON_OUTPUT" = false ]; then
+  echo "Analyzing all payload runs..."
+  echo ""
+fi
 
 # Parse each payload run and build a data structure
-# Format: job_name|timestamp|status (one line per job per run)
+# Format: job_name|timestamp|status|url (one line per job per run)
 
 i=1
 while read -r url; do
@@ -109,28 +137,32 @@ while read -r url; do
   # Write to per-iteration file to avoid concurrent append issues
   jobs_file="$TMPDIR/jobs_$i.txt"
 
-  # Get failed jobs
-  grep -oE '<span class="text-danger">[^<]+</span>' "$html_file" 2>/dev/null | \
-    sed -E 's/<span class="text-danger">([^<]+)<\/span>/\1/' | \
-    grep '^periodic-ci-' | \
-    while read -r job; do
-      echo "$job|$timestamp|failed" >> "$jobs_file"
+  # Get failed jobs with URLs
+  # Look for pattern: <a href="url"><span class="text-danger">job-name</span></a>
+  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="text-danger">[^<]+</span></a>' "$html_file" 2>/dev/null | \
+    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
+    while IFS='|' read -r job url; do
+      if [[ "$job" == periodic-ci-* ]]; then
+        echo "$job|$timestamp|failed|$url" >> "$jobs_file"
+      fi
     done || true
 
-  # Get successful jobs
-  grep -oE '<span class="text-success">[^<]+</span>' "$html_file" 2>/dev/null | \
-    sed -E 's/<span class="text-success">([^<]+)<\/span>/\1/' | \
-    grep '^periodic-ci-' | \
-    while read -r job; do
-      echo "$job|$timestamp|success" >> "$jobs_file"
+  # Get successful jobs with URLs
+  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="text-success">[^<]+</span></a>' "$html_file" 2>/dev/null | \
+    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
+    while IFS='|' read -r job url; do
+      if [[ "$job" == periodic-ci-* ]]; then
+        echo "$job|$timestamp|success|$url" >> "$jobs_file"
+      fi
     done || true
 
-  # Get running jobs
-  grep -oE '<span class="">[^<]+</span>' "$html_file" 2>/dev/null | \
-    sed -E 's/<span class="">([^<]+)<\/span>/\1/' | \
-    grep '^periodic-ci-' | \
-    while read -r job; do
-      echo "$job|$timestamp|running" >> "$jobs_file"
+  # Get running jobs with URLs
+  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="">[^<]+</span></a>' "$html_file" 2>/dev/null | \
+    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
+    while IFS='|' read -r job url; do
+      if [[ "$job" == periodic-ci-* ]]; then
+        echo "$job|$timestamp|running|$url" >> "$jobs_file"
+      fi
     done || true
 
   i=$((i+1))
@@ -149,10 +181,11 @@ fi
 # Sort all job entries by timestamp (newest first) and job name
 sort -t'|' -k2,2r -k1,1 "$TMPDIR/payload_jobs.txt" > "$TMPDIR/payload_jobs_sorted.txt"
 
-# Build consecutive failure counts
+# Build consecutive failure counts and URLs
 # For each unique job, find its most recent status and count consecutive failures
 declare -A job_most_recent_status
 declare -A job_consecutive_failures
+declare -A job_failure_urls
 declare -A job_is_running
 
 # Get unique job names
@@ -173,17 +206,22 @@ while read -r job; do
     job_is_running["$job"]=1
   fi
 
-  # Count consecutive failures (only if currently failed)
+  # Count consecutive failures and collect URLs (only if currently failed)
   if [ "$most_recent_status" = "failed" ]; then
     consecutive=0
-    while IFS='|' read -r j ts status; do
+    urls=()
+    while IFS='|' read -r j ts status url; do
       if [ "$status" = "failed" ]; then
         consecutive=$((consecutive + 1))
+        urls+=("$url")
       else
         break
       fi
     done <<< "$job_entries"
     job_consecutive_failures["$job"]=$consecutive
+
+    # Store URLs as comma-separated string
+    job_failure_urls["$job"]=$(IFS=','; echo "${urls[*]}")
   fi
 done <<< "$unique_jobs"
 
@@ -204,6 +242,58 @@ done
 NUM_FAILED=${#failed_jobs[@]}
 NUM_RUNNING=${#running_jobs[@]}
 
+# JSON output mode
+if [ "$JSON_OUTPUT" = true ]; then
+  printf '{"failed":['
+
+  first_job=true
+  for job in "${failed_jobs[@]}"; do
+    consecutive=${job_consecutive_failures[$job]:-0}
+    urls_str=${job_failure_urls[$job]:-}
+
+    # Convert comma-separated URLs to JSON array
+    printf -v urls_json '['
+    if [ -n "$urls_str" ]; then
+      IFS=',' read -ra urls_array <<< "$urls_str"
+      first_url=true
+      for url in "${urls_array[@]}"; do
+        if [ "$first_url" = true ]; then
+          first_url=false
+        else
+          printf -v urls_json '%s,' "$urls_json"
+        fi
+        printf -v urls_json '%s"%s"' "$urls_json" "$url"
+      done
+    fi
+    printf -v urls_json '%s]' "$urls_json"
+
+    if [ "$first_job" = true ]; then
+      first_job=false
+    else
+      printf ','
+    fi
+
+    printf '{"name":"%s","consecutive":%d,"urls":%s}' "$job" "$consecutive" "$urls_json"
+  done
+
+  printf '],"running":['
+
+  first_running=true
+  for job in "${running_jobs[@]}"; do
+    if [ "$first_running" = true ]; then
+      first_running=false
+    else
+      printf ','
+    fi
+
+    printf '{"name":"%s"}' "$job"
+  done
+
+  printf ']}\n'
+  exit 0
+fi
+
+# Text output mode (original behavior)
 if [ "$NUM_FAILED" -gt 0 ]; then
   echo "Failed payload jobs:"
   for job in "${failed_jobs[@]}"; do

@@ -46,3 +46,50 @@ count_consecutive_failures() {
 
   echo "${consecutive}|${total_fail}|${total_pass}|${total_abort}"
 }
+
+# Extract consecutive failure URLs from prow history
+# Args: job_name, html_file
+# Output: JSON array of URLs for consecutive failures
+get_consecutive_failure_urls() {
+  local job_name="$1"
+  local html_file="$2"
+
+  # Escape regex special characters in job name for safe grep pattern matching
+  local escaped_job_name=$(printf '%s\n' "$job_name" | sed 's/[[\.*^$/]/\\&/g')
+
+  # Extract the table row section for this job
+  # Each job row contains links with class run-failure, run-success, etc.
+  local job_section=$(grep -A 50 ">${escaped_job_name}<" "$html_file" | head -50)
+
+  # Extract href and class pairs from <a> tags
+  # Format: href|class (one per line)
+  local run_links=$(echo "$job_section" | \
+    grep -oE '<a[^>]*href="[^"]*"[^>]*class="run-[^"]*"' | \
+    sed -E 's/.*href="([^"]*)".*class="(run-[^"]*)".*$/\1|\2/')
+
+  local urls=()
+  local found_non_failure=0
+
+  while IFS='|' read -r url run_class; do
+    [ -z "$url" ] && continue
+
+    case "$run_class" in
+      run-failure)
+        if [ "$found_non_failure" -eq 0 ]; then
+          urls+=("$url")
+        fi
+        ;;
+      run-success|run-aborted)
+        found_non_failure=1
+        ;;
+    esac
+  done <<< "$run_links"
+
+  # Output as JSON array
+  printf '['
+  for i in "${!urls[@]}"; do
+    [ $i -gt 0 ] && printf ','
+    printf '"%s"' "${urls[$i]}"
+  done
+  printf ']'
+}

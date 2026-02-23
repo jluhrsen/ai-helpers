@@ -3,10 +3,17 @@
 set -euo pipefail
 
 # ci:e2e-retest - Find and retest failed e2e CI jobs on a PR
-# Usage: ./e2e-retest.sh [repo] <pr-number>
+# Usage: ./e2e-retest.sh [--json] [repo] <pr-number>
 
 # Source shared utilities
 source "$(dirname "$0")/common.sh"
+
+# Parse --json flag
+JSON_OUTPUT=false
+if [ $# -gt 0 ] && [ "$1" = "--json" ]; then
+  JSON_OUTPUT=true
+  shift
+fi
 
 # Parse arguments
 if [ $# -eq 1 ]; then
@@ -14,11 +21,13 @@ if [ $# -eq 1 ]; then
   # Auto-detect from git remote
   REPO=$(git remote -v | head -1 | sed -E 's/.*github\.com[:/]([^/]+\/[^ .]+).*/\1/' | sed 's/\.git$//' || true)
   if [ -z "$REPO" ]; then
-    echo "❌ Error: Could not detect repository from git remote."
-    echo "Please specify repo: $0 <repo> <pr-number>"
+    echo "❌ Error: Could not detect repository from git remote." >&2
+    echo "Please specify repo: $0 [--json] <repo> <pr-number>" >&2
     exit 1
   fi
-  echo "Repository: $REPO"
+  if [ "$JSON_OUTPUT" = false ]; then
+    echo "Repository: $REPO"
+  fi
 
 elif [ $# -eq 2 ]; then
   REPO_ARG="$1"
@@ -31,11 +40,13 @@ elif [ $# -eq 2 ]; then
     # Assume openshift org
     REPO="openshift/$REPO_ARG"
   fi
-  echo "Repository: $REPO"
+  if [ "$JSON_OUTPUT" = false ]; then
+    echo "Repository: $REPO"
+  fi
 
 else
-  echo "❌ Error: Invalid arguments"
-  echo "Usage: $0 [repo] <pr-number>"
+  echo "❌ Error: Invalid arguments" >&2
+  echo "Usage: $0 [--json] [repo] <pr-number>" >&2
   exit 1
 fi
 
@@ -45,11 +56,13 @@ REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
 
 # Validate PR number
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-  echo "❌ Error: PR number must be numeric"
+  echo "❌ Error: PR number must be numeric" >&2
   exit 1
 fi
 
-echo ""
+if [ "$JSON_OUTPUT" = false ]; then
+  echo ""
+fi
 
 # Create unique temp directory and setup cleanup
 TMPDIR=$(mktemp -d)
@@ -66,12 +79,20 @@ wait
 
 # Validate fetched data exists and is non-empty
 if [ ! -s "$TMPDIR/e2e_pr_status.json" ]; then
-  echo "Error: Failed to fetch PR status checks from GitHub" >&2
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo '{"error":"Failed to fetch PR status checks from GitHub","failed":[],"running":[]}' >&2
+  else
+    echo "Error: Failed to fetch PR status checks from GitHub" >&2
+  fi
   exit 1
 fi
 
 if [ ! -s "$TMPDIR/e2e_prow_history.html" ]; then
-  echo "Error: Failed to fetch prow history" >&2
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo '{"error":"Failed to fetch prow history","failed":[],"running":[]}' >&2
+  else
+    echo "Error: Failed to fetch prow history" >&2
+  fi
   exit 1
 fi
 
@@ -102,6 +123,48 @@ else
   NUM_RUNNING=0
 fi
 
+# JSON output mode
+if [ "$JSON_OUTPUT" = true ]; then
+  printf '{"failed":['
+
+  first_job=true
+  while IFS= read -r job; do
+    [ -z "$job" ] && continue
+
+    FULL_JOB="pull-ci-${ORG}-${REPO_NAME}-${BASE_REF}-${job}"
+    STATS=$(count_consecutive_failures "$FULL_JOB" "$TMPDIR/e2e_prow_history.html")
+    CONSEC=$(echo "$STATS" | cut -d'|' -f1)
+    URLS=$(get_consecutive_failure_urls "$FULL_JOB" "$TMPDIR/e2e_prow_history.html")
+
+    if [ "$first_job" = true ]; then
+      first_job=false
+    else
+      printf ','
+    fi
+
+    printf '{"name":"%s","consecutive":%d,"urls":%s}' "$job" "$CONSEC" "$URLS"
+  done <<< "$FAILED_E2E"
+
+  printf '],"running":['
+
+  first_running=true
+  while IFS= read -r job; do
+    [ -z "$job" ] && continue
+
+    if [ "$first_running" = true ]; then
+      first_running=false
+    else
+      printf ','
+    fi
+
+    printf '{"name":"%s"}' "$job"
+  done <<< "$RUNNING_E2E"
+
+  printf ']}\n'
+  exit 0
+fi
+
+# Text output mode (original behavior)
 # Display failed jobs with statistics
 if [ "$NUM_FAILED" -gt 0 ]; then
   echo "Failed e2e jobs:"
