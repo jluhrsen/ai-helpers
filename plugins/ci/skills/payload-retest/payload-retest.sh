@@ -137,33 +137,50 @@ while read -r url; do
   # Write to per-iteration file to avoid concurrent append issues
   jobs_file="$TMPDIR/jobs_$i.txt"
 
-  # Get failed jobs with URLs
-  # Look for pattern: <a href="url"><span class="text-danger">job-name</span></a>
-  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="text-danger">[^<]+</span></a>' "$html_file" 2>/dev/null | \
-    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
-    while IFS='|' read -r job url; do
-      if [[ "$job" == periodic-ci-* ]]; then
-        echo "$job|$timestamp|failed|$url" >> "$jobs_file"
-      fi
-    done || true
+  # Parse jobs with URLs using awk to handle multi-line patterns
+  # HTML structure:
+  #   <span class="text-danger">job-name</span>:
+  #
+  #   <a href="url">guid</a>
 
-  # Get successful jobs with URLs
-  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="text-success">[^<]+</span></a>' "$html_file" 2>/dev/null | \
-    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
-    while IFS='|' read -r job url; do
-      if [[ "$job" == periodic-ci-* ]]; then
-        echo "$job|$timestamp|success|$url" >> "$jobs_file"
-      fi
-    done || true
+  # Process failed jobs
+  awk '
+    /<span class="text-danger">/ {
+      match($0, /<span class="text-danger">([^<]+)<\/span>/, arr)
+      job = arr[1]
+      getline; getline  # Skip next 2 lines to get to <a href>
+      if (match($0, /href="([^"]+)"/, url_arr)) {
+        if (job ~ /^periodic-ci-/) {
+          print job "|'"$timestamp"'|failed|" url_arr[1]
+        }
+      }
+    }
+  ' "$html_file" >> "$jobs_file" 2>/dev/null || true
 
-  # Get running jobs with URLs
-  grep -oE '<a[^>]*href="[^"]*"[^>]*><span class="">[^<]+</span></a>' "$html_file" 2>/dev/null | \
-    sed -E 's|.*href="([^"]*)".*<span[^>]*>([^<]+)</span>.*|\2|\1|' | \
-    while IFS='|' read -r job url; do
-      if [[ "$job" == periodic-ci-* ]]; then
-        echo "$job|$timestamp|running|$url" >> "$jobs_file"
-      fi
-    done || true
+  # Process successful jobs
+  awk '
+    /<span class="text-success">/ {
+      match($0, /<span class="text-success">([^<]+)<\/span>/, arr)
+      job = arr[1]
+      getline; getline  # Skip next 2 lines to get to <a href>
+      if (match($0, /href="([^"]+)"/, url_arr)) {
+        if (job ~ /^periodic-ci-/) {
+          print job "|'"$timestamp"'|success|" url_arr[1]
+        }
+      }
+    }
+  ' "$html_file" >> "$jobs_file" 2>/dev/null || true
+
+  # Process running jobs (may not have URLs)
+  awk '
+    /<span class="">/ {
+      match($0, /<span class="">([^<]+)<\/span>/, arr)
+      job = arr[1]
+      if (job ~ /^periodic-ci-/) {
+        print job "|'"$timestamp"'|running|"
+      }
+    }
+  ' "$html_file" >> "$jobs_file" 2>/dev/null || true
 
   i=$((i+1))
 done <<< "$PAYLOAD_URLS"

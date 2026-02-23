@@ -57,33 +57,33 @@ get_consecutive_failure_urls() {
   # Escape regex special characters in job name for safe grep pattern matching
   local escaped_job_name=$(printf '%s\n' "$job_name" | sed 's/[[\.*^$/]/\\&/g')
 
-  # Extract the table row section for this job
-  # Each job row contains links with class run-failure, run-success, etc.
+  # Extract the table row section for this job (next 50 lines after job name)
   local job_section=$(grep -A 50 ">${escaped_job_name}<" "$html_file" | head -50)
 
-  # Extract href and class pairs from <a> tags
-  # Format: href|class (one per line)
-  local run_links=$(echo "$job_section" | \
-    grep -oE '<a[^>]*href="[^"]*"[^>]*class="run-[^"]*"' | \
-    sed -E 's/.*href="([^"]*)".*class="(run-[^"]*)".*$/\1|\2/')
-
+  # Extract all <td> elements with their class and href
+  # HTML structure: <td class="...run-failure..."><a href="/view/...">...</a></td>
   local urls=()
   local found_non_failure=0
 
-  while IFS='|' read -r url run_class; do
-    [ -z "$url" ] && continue
-
-    case "$run_class" in
-      run-failure)
-        if [ "$found_non_failure" -eq 0 ]; then
+  # Parse each table cell
+  while IFS= read -r line; do
+    # Check if this is a td with run-failure class
+    if echo "$line" | grep -q 'class=".*run-failure'; then
+      if [ "$found_non_failure" -eq 0 ]; then
+        # Extract href from the <a> tag in the next line or same line
+        local url=$(echo "$line" | grep -oE 'href="[^"]*"' | sed 's/href="//;s/"//' | head -1)
+        if [ -n "$url" ]; then
+          # Make absolute URL if relative
+          if [[ "$url" == /view/* ]]; then
+            url="https://prow.ci.openshift.org${url}"
+          fi
           urls+=("$url")
         fi
-        ;;
-      run-success|run-aborted)
-        found_non_failure=1
-        ;;
-    esac
-  done <<< "$run_links"
+      fi
+    elif echo "$line" | grep -qE 'class=".*run-(success|aborted)'; then
+      found_non_failure=1
+    fi
+  done <<< "$job_section"
 
   # Output as JSON array
   printf '['
