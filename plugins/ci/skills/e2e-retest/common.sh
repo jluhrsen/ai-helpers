@@ -57,16 +57,22 @@ get_consecutive_failure_urls() {
   # Escape regex special characters in job name for safe grep pattern matching
   local escaped_job_name=$(printf '%s\n' "$job_name" | sed 's/[[\.*^$/]/\\&/g')
 
-  # Extract the table row section for this job (next 50 lines after job name)
-  local job_section=$(grep -A 50 ">${escaped_job_name}<" "$html_file" | head -50)
+  # Extract the table row for this specific job (stop at </tr>)
+  # This prevents bleeding into the next job's row
+  local job_row=$(grep -A 50 ">${escaped_job_name}<" "$html_file" | sed -n '1,/<\/tr>/p')
 
   # Extract all <td> elements with their class and href
   # HTML structure: <td class="...run-failure..."><a href="/view/...">...</a></td>
   local urls=()
   local found_non_failure=0
 
-  # Parse each table cell
+  # Parse each table cell in this row only
   while IFS= read -r line; do
+    # Skip if we've reached the end of the row
+    if echo "$line" | grep -q '</tr>'; then
+      break
+    fi
+
     # Check if this is a td with run-failure class
     if echo "$line" | grep -q 'class=".*run-failure'; then
       if [ "$found_non_failure" -eq 0 ]; then
@@ -83,7 +89,7 @@ get_consecutive_failure_urls() {
     elif echo "$line" | grep -qE 'class=".*run-(success|aborted)'; then
       found_non_failure=1
     fi
-  done <<< "$job_section"
+  done <<< "$job_row"
 
   # Output as JSON array
   printf '['
